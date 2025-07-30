@@ -1,0 +1,35 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.7",
+    "pybind11>=2.10",
+    "setuptools>=64",
+    "wheel"
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "soc"
+version = "0.1.0"
+description = "Spin-Orbit Coupling tools with Python/C++ hybrid backend"
+authors = [
+    { name = "Ivan Infante" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "matplotlib>=3.5",
+    "pymatgen>=2022.0"
+]
+
+[project.scripts]
+soc = "soc.soc_driver:main"
+
+[tool.setuptools]
+# This tells setuptools to use the src/ layout
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = [ "src" ]
+

@@ -1,0 +1,19 @@
+name: soc
+channels:
+  - conda-forge
+dependencies:
+  - python >=3.9
+  - pip
+  - numpy >=1.22
+  - scipy >=1.8
+  - matplotlib >=3.5
+  - pybind11 >=2.10
+  - eigen >=3.4
+  - libint >=2.6
+  - boost >=1.70
+  - compilers
+  - cmake >=3.16
+  - ninja >=1.10
+  - pip:
+      - pymatgen >=2022.0
+      - scikit-build-core >=0.7
