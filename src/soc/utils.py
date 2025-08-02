@@ -1,6 +1,7 @@
 # utils.py
 import numpy as np
 from scipy.linalg import fractional_matrix_power
+from scipy.linalg import cholesky, solve_triangular
 from . import config
 
 def build_shell_dicts(syms, coords_ang, basis_dict):
@@ -96,6 +97,16 @@ def ao_population_lowdin(alpha, beta, S):
     pop_sum[pop_sum < 1e-16] = 1.0
     return np.squeeze(pop / pop_sum)
 
+def ao_population_lowdin_raw(alpha, beta, S):
+    """Löwdin AO population (UN-normalized). Columns sum to α†Sα + β†Sβ."""
+    Shalf = lowdin_Ssqrt(S)
+    alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
+    beta  = np.atleast_2d(beta).T  if beta.ndim  == 1 else beta
+    a, b = Shalf @ alpha, Shalf @ beta
+    pop = (np.abs(a)**2 + np.abs(b)**2).real
+    return np.squeeze(pop)
+
+
 def ao_population_mulliken(alpha, beta, S):
     """Calculates Mulliken population for a given spinor."""
     alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
@@ -138,6 +149,101 @@ def compute_nuclear_repulsion_from_list(coords_bohr, Z_list):
 def compute_total_energy(D, F, E_nuc):
     # D, F: AO basis, E_nuc: scalar
     return 0.5 * np.sum(D * (F + F.T)) + E_nuc
+
+# utils.py
+import numpy as np
+
+def select_mo_subspace_indices(
+    eps_Ha,
+    occ_vector,
+    n_occ_keep,
+    n_virt_keep,
+    *,
+    explicit_idx=None,
+    occ_threshold=1e-3,
+    respect_degeneracy=True,
+    degeneracy_tol_Ha=1e-8,
+):
+    """
+    Build MO subspace indices as: last n_occ_keep occupied (ending at HOMO)
+    + first n_virt_keep virtual (starting at LUMO).
+
+    If respect_degeneracy is True, we enlarge the selection to include
+    the full degenerate block at the selection boundaries.
+
+    Parameters
+    ----------
+    eps_Ha : (n_mo,) array
+        MO energies in Hartree (canonical MO order).
+    occ_vector : (n_mo,) or (n_mo,2)
+        Occupations; if 2D we sum across spin.
+    n_occ_keep, n_virt_keep : int
+        Counts to keep on each side of the Fermi.
+    explicit_idx : iterable or None
+        If provided, return sorted(unique(explicit_idx)) and ignore counts.
+    occ_threshold : float
+        Occupation cutoff to decide occupied vs virtual.
+    respect_degeneracy : bool
+        If True, pad selection at HOMO/LUMO boundaries to include full degenerate blocks.
+    degeneracy_tol_Ha : float
+        Energy tolerance for degeneracy detection in Hartree.
+
+    Returns
+    -------
+    idx_sel : (k,) np.ndarray[int]
+        Sorted unique indices for the subspace.
+    """
+    if explicit_idx is not None:
+        return np.array(sorted(set(int(i) for i in explicit_idx)), dtype=int)
+
+    eps_Ha = np.asarray(eps_Ha, dtype=float)
+    occ = np.asarray(occ_vector)
+    if occ.ndim == 2:
+        occ = occ.sum(axis=1)
+    occ_mask = occ > occ_threshold
+
+    occ_idx = np.where(occ_mask)[0]
+    vir_idx = np.where(~occ_mask)[0]
+
+    # Base selection: highest-energy occupieds + lowest-energy virtuals
+    sel_occ = occ_idx[-int(n_occ_keep):] if int(n_occ_keep) > 0 else np.array([], dtype=int)
+    sel_vir = vir_idx[:int(n_virt_keep)] if int(n_virt_keep) > 0 else np.array([], dtype=int)
+
+    if respect_degeneracy:
+        # Pad at occupied boundary (top of selection)
+        if sel_occ.size:
+            E_top_occ = eps_Ha[sel_occ[-1]]
+            same = np.where(np.abs(eps_Ha[occ_idx] - E_top_occ) <= degeneracy_tol_Ha)[0]
+            if same.size:
+                deg_block = occ_idx[same]  # all with energy ≈ E_top_occ
+                sel_occ = np.union1d(sel_occ, deg_block)
+
+        # Pad at virtual boundary (bottom of selection)
+        if sel_vir.size:
+            E_bot_vir = eps_Ha[sel_vir[0]]
+            same = np.where(np.abs(eps_Ha[vir_idx] - E_bot_vir) <= degeneracy_tol_Ha)[0]
+            if same.size:
+                deg_block = vir_idx[same]
+                sel_vir = np.union1d(sel_vir, deg_block)
+
+    idx_sel = np.union1d(sel_occ, sel_vir).astype(int)
+    return idx_sel
+
+    ## --- Analysis 3: SOC Spinors in Spin-Free MO Basis ---
+    from scipy.linalg import cholesky, solve_triangular
+
+def chol_orthonormalize(C, S_AO):
+    """
+    Return C_ortho with C_ortho† S_AO C_ortho = I.
+    Uses Cholesky of S_mo = C† S C (upper R), solves triangular instead of forming inv(R).
+    """
+    # S_mo = R† R
+    S_mo = C.conj().T @ (S_AO @ C)
+    R = cholesky(S_mo, lower=False, check_finite=False, overwrite_a=False)
+    # Solve R X = C†  => X = R^{-1} C† ;  then C_ortho = (X)†
+    X = solve_triangular(R, C.conj().T, lower=False, trans='N',
+                         overwrite_b=False, check_finite=False)
+    return X.conj().T
 
 
 

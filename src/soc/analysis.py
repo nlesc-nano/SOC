@@ -3,10 +3,16 @@ import numpy as np
 from . import utils
 
 def decompose_pop(pop_AO, ao_info, l_list, unique_syms):
-    """Decomposes AO populations by atom and angular momentum."""
     contrib = {sym: {l: 0.0 for l in l_list} for sym in unique_syms}
+    tot = float(np.sum(pop_AO).real)
+    if tot <= 1e-16:
+        tot = 1.0
     for k, ao in enumerate(ao_info):
         contrib[ao['sym']][ao['l']] += float(pop_AO[k])
+    # normalize to fractions
+    for sym in contrib:
+        for l in contrib[sym]:
+            contrib[sym][l] /= tot
     return contrib
 
 def format_contrib(contrib, l_labels):

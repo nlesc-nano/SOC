@@ -1,6 +1,6 @@
 # config.py
 import numpy as np
-import os, sys 
+import os, sys, re  
 import argparse 
 
 ## --- Global Constants ---
@@ -30,6 +30,12 @@ MO_PATH = "MOs.txt" # Must be specified, no default
 MO_ALPHA_PATH = "MOs_alpha.txt" # if UKS=True, Must be specified, no default
 MO_BETA_PATH  = "MOs_beta.txt" # if UKS=True, Must be specified, no default
 
+# --- Output of SOC eigenvectors ---
+WRITE_SPINORS = False                 # off by default
+SPINORS_SUBSET = "printed"            # "printed" (= the 'to_print' selection) or "all"
+OUTDIR = "."                           # where to write files
+SPINORS_BASENAME = "soc_spinors"       # base filename (-> soc_spinors.npz, soc_spinors.csv)
+
 ## --- File Paths ---
 PERIODIC = False # This is the default 
 # PERIODIC=True , then specify lattice . It must be specified as -A1 -A2 -A3 
@@ -54,6 +60,45 @@ energy_window_eV = 20.0 # This is the default. It can be hidden.
 
 # Number of MOs to print on screen
 N_print = 30 # Default but must be specified 
+
+# --- SOC subspace selection around the Fermi level (HOMO/LUMO) ---
+# mo_indices = [n_occ, n_virt] means: take the last n_occ occupied + first n_virt virtual MOs
+# Set to [0, 0] to disable subspace solve (i.e., do full AO spinor diagonalization).
+mo_indices = [1000, 1000]
+# Per-spin subspace counts (UKS only): [NOCC, NVIRT]
+MO_WINDOW_ALPHA = None   # e.g. [232, 620]
+MO_WINDOW_BETA  = None   # e.g. [232, 620]
+
+def _parse_span_to_pair(s: str):
+    """
+    Accepts formats like '233:619', '233,619', '[233,619]'.
+    Returns [i0, i1] as ints (0-based, inclusive).
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if s.startswith('[') and s.endswith(']'):
+        s = s[1:-1]
+    s = s.replace(' ', '')
+    if ':' in s:
+        a, b = s.split(':', 1)
+    elif ',' in s:
+        a, b = s.split(',', 1)
+    else:
+        raise argparse.ArgumentTypeError(
+            f"Invalid span '{s}'. Use i0:i1 or i0,i1 (0-based, inclusive)."
+        )
+    try:
+        i0, i1 = int(a), int(b)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integers in span '{s}'."
+        )
+    if i0 < 0 or i1 < 0 or i0 > i1:
+        raise argparse.ArgumentTypeError(
+            f"Invalid span [{i0}, {i1}]. Must satisfy 0 <= i0 <= i1."
+        )
+    return [i0, i1]
 
 def _parse_vec3(tokens, name):
     if tokens is None:
@@ -93,6 +138,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
                         help="Alpha MOs file for UKS (required if --uks)")
     g_spin.add_argument("--mo-beta", dest="MO_BETA_PATH",
                         help="Beta  MOs file for UKS (required if --uks)")
+    
+    # Only meaningful for UKS; validated after parse
+    g_spin.add_argument("--mo-window-alpha", dest="MO_WINDOW_ALPHA",
+                        nargs=2, type=int, metavar=("NOCC","NVIRT"), default=None,
+                        help="Alpha subspace counts: last NOCC occ + first NVIRT virt (UKS only).")
+    g_spin.add_argument("--mo-window-beta", dest="MO_WINDOW_BETA",
+                        nargs=2, type=int, metavar=("NOCC","NVIRT"), default=None,
+                        help="Beta subspace counts: last NOCC occ + first NVIRT virt (UKS only).")
 
     # --- Periodicity & lattice ---
     g_cell = p.add_argument_group("Periodicity & lattice")
@@ -118,6 +171,17 @@ def build_cli_parser() -> argparse.ArgumentParser:
                        help="Energy window (eV) around Fermi for filtering SOC matrix elements. "
                             "Use 0 or negative to disable.")
 
+    g_out = p.add_argument_group("Spinor output")
+    g_out.add_argument("--write-spinors", action=argparse.BooleanOptionalAction, default=None,
+                       help="Write SOC eigenvectors/eigenvalues/occupations to NPZ+CSV (default: False). "
+                            "Use --no-write-spinors to force off.")
+    g_out.add_argument("--spinors-subset", choices=["printed", "all"], default=None,
+                       help="Which spinors to write: 'printed' (selection used in analysis) or 'all'.")
+    g_out.add_argument("--outdir", dest="OUTDIR", default=None,
+                       help="Output directory for spinor files (default: '.').")
+    g_out.add_argument("--basename", dest="SPINORS_BASENAME", default=None,
+                       help="Base filename without extension (default: 'soc_spinors').")
+
     # --- Misc runtime knobs ---
     g_misc = p.add_argument_group("Runtime & output")
     g_misc.add_argument("--nthreads", type=int, default=None,
@@ -129,6 +193,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
     g_misc.add_argument("--dry-run", action="store_true",
                         help="Parse and show final settings, then exit")
 
+    g_misc.add_argument("--mo-window", nargs=2, type=int, metavar=("NOCC","NVIRT"),
+                        help="SOC subspace window around HOMO: last NOCC occ + first NVIRT virt (default from config.mo_indices)")
+    
     p.add_argument("--version", action="version", version="soc 0.1.0")
     return p
 
@@ -141,6 +208,8 @@ def apply_cli_overrides(args: argparse.Namespace):
     global UKS, MO_PATH, MO_ALPHA_PATH, MO_BETA_PATH
     global PERIODIC, LATTICE
     global soc_active_atoms, calculate_offsite_soc, energy_window_eV, NTHREADS, N_print
+    global WRITE_SPINORS, SPINORS_SUBSET, OUTDIR, SPINORS_BASENAME
+    global mo_indices
 
     # Basic paths / basis
     if args.XYZ_PATH is not None:
@@ -203,11 +272,41 @@ def apply_cli_overrides(args: argparse.Namespace):
         ew = float(args.energy_window_eV)
         energy_window_eV = None if ew <= 0.0 else ew
 
+    if args.write_spinors is not None:
+        WRITE_SPINORS = bool(args.write_spinors)
+    if args.SPINORS_BASENAME is not None:
+        SPINORS_BASENAME = args.SPINORS_BASENAME
+    if args.OUTDIR is not None:
+        OUTDIR = args.OUTDIR
+    if args.spinors_subset is not None:
+        SPINORS_SUBSET = args.spinors_subset
+
+    if args.mo_window is not None:
+        mo_indices = [max(0, int(args.mo_window[0])), max(0, int(args.mo_window[1]))]
+    
     # Runtime
     if args.nthreads is not None:
         NTHREADS = max(1, int(args.nthreads))
     if args.N_print is not None:
         N_print = max(1, int(args.N_print))
+
+    # ---- Per-spin subspace counts (UKS only) ----
+    global MO_WINDOW_ALPHA, MO_WINDOW_BETA
+
+    if args.MO_WINDOW_ALPHA is not None or args.MO_WINDOW_BETA is not None:
+        if not UKS:
+            raise ValueError("The options --mo-window-alpha/--mo-window-beta require --uks.")
+        if args.MO_WINDOW_ALPHA is not None:
+            a_occ, a_vir = map(int, args.MO_WINDOW_ALPHA)
+            MO_WINDOW_ALPHA = [max(0, a_occ), max(0, a_vir)]
+        if args.MO_WINDOW_BETA is not None:
+            b_occ, b_vir = map(int, args.MO_WINDOW_BETA)
+            MO_WINDOW_BETA = [max(0, b_occ), max(0, b_vir)]
+        print(f"[CONFIG] UKS per-spin subspace counts: "
+              f"alpha={MO_WINDOW_ALPHA}, beta={MO_WINDOW_BETA}")
+    else:
+        MO_WINDOW_ALPHA = None
+        MO_WINDOW_BETA  = None
 
 
 def parse_and_apply_cli(argv=None):
@@ -236,6 +335,10 @@ def parse_and_apply_cli(argv=None):
             "energy_window_eV": config.energy_window_eV,
             "NTHREADS": config.NTHREADS,
             "N_print": config.N_print,
+            "WRITE_SPINORS": WRITE_SPINORS,
+            "SPINORS_SUBSET": SPINORS_SUBSET,
+            "OUTDIR": OUTDIR,
+            "SPINORS_BASENAME": SPINORS_BASENAME,
         }
         print("[SOC] Resolved settings:")
         pprint.pprint(settings)
