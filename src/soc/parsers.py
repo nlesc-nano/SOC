@@ -1,6 +1,331 @@
 # parsers.py
-import numpy as np
 import collections
+import os, re
+import time
+import numpy as np
+from scipy.sparse import issparse, csr_matrix, save_npz, load_npz
+
+import re
+import numpy as np
+
+_NUM_RE = re.compile(r"""[\+\-]?(?:\d+\.\d*|\.\d+|\d+)(?:[EeDd][\+\-]?\d+)?""", re.VERBOSE)
+
+def save_mo_csr_singlefile(C, eps, occ, outpath):
+    """
+    Store C (CSR or dense), eps, occ in a single .npz file.
+    Converts dense C to CSR automatically.
+    """
+    if not issparse(C):
+        C = csr_matrix(C)
+    np.savez_compressed(
+        outpath,
+        data=C.data,
+        indices=C.indices,
+        indptr=C.indptr,
+        shape=C.shape,
+        eps=eps,
+        occ=occ
+    )
+    print(f"[MOs] Wrote C, eps, occ to: {outpath}")
+
+def read_mos_auto(path, n_ao_total, verbose=False):
+    from scipy import sparse
+    import numpy as np
+    import os
+
+    ext = os.path.splitext(path)[-1].lower()
+    if ext == ".npz":
+        if verbose:
+            print(f"[MOs] Detected .npz: {path}")
+        d = np.load(path)
+        C = sparse.csr_matrix((d['data'], d['indices'], d['indptr']), shape=d['shape'])
+        eps = d['eps']
+        occ = d['occ']
+        if verbose:
+            print(f"[MOs] Loaded C shape: {C.shape}, eps: {eps.shape}, occ: {occ.shape}")
+        return C, eps, occ
+    else:
+        # Otherwise parse text, then save .npz for next time
+        C, eps, occ = read_mos_txt_streaming(path, n_ao_total, verbose=verbose)
+        # Write for future use
+        outdir = os.path.dirname(os.path.abspath(path))
+        base = os.path.splitext(os.path.basename(path))[0]
+        outpath = os.path.join(outdir, base + "_csr.npz")
+        save_mo_csr_singlefile(C, eps, occ, outpath)
+        return C, eps, occ
+
+def _extract_numbers(s: str):
+    # Robust fallback (handles labels and D exponents)
+    toks = _NUM_RE.findall(s)
+    return [float(t.replace('D','E').replace('d','E')) for t in toks]
+
+def _fast_tail_tokens(line: str, n_cols: int):
+    """
+    Fast path: grab the last n_cols whitespace-separated tokens from the line.
+    Assumes those tokens are numeric (possibly with D exponents).
+    Returns a list[str] of length n_cols or fewer (if the line is wrapped).
+    """
+    # Normalize D/d exponents for speed
+    s = line.replace('D','E').replace('d','E').strip()
+    if not s:
+        return []
+    parts = s.rsplit(None, n_cols)  # split from right, at most n_cols+1 pieces
+    if len(parts) == 1:
+        # entire line is <= n_cols tokens; we don't know how many -> tokenise fully
+        toks = parts[0].split()
+        return toks[-n_cols:]
+    # parts[-n_cols:] are the last n_cols tokens (but they are separate strings).
+    # If len(parts) == n_cols+1, last n_cols tokens are already separated.
+    # If len(parts) < n_cols+1, the first element may contain multiple tokens.
+    tail_tokens = []
+    # The rightmost piece is the last token; walk from right to left until we have n_cols tokens.
+    for i in range(len(parts)-1, -1, -1):
+        seg = parts[i].split()
+        # append in reverse so overall order remains left->right when we reverse later
+        tail_tokens.extend(reversed(seg))
+        if len(tail_tokens) >= n_cols:
+            break
+    tail_tokens = list(reversed(tail_tokens))[:n_cols]
+    return tail_tokens
+
+def _parse_tail_floats(line: str, n_cols: int):
+    """
+    Try the fast tail token path; if count < n_cols, return partial (caller may wrap).
+    If a token fails to float(), fall back to regex on the whole line.
+    """
+    toks = _fast_tail_tokens(line, n_cols)
+    if not toks:
+        return []
+    try:
+        arr = np.array(toks, dtype=float)
+        return arr
+    except ValueError:
+        # Fallback: robust but slower
+        nums = _extract_numbers(line)
+        # take last n_cols numbers
+        if len(nums) >= n_cols:
+            return np.asarray(nums[-n_cols:], dtype=float)
+        return np.asarray(nums, dtype=float)
+
+def read_mos_txt_streaming(path, n_ao_total, *,
+                           dtype=np.float32,
+                           mmap_path=None,
+                           return_memmap=True,
+                           verbose=True,
+                           debug=False,
+                           log_every=200):
+    """
+    Fast streaming CP2K MO parser with progress and timing info.
+    """
+    if mmap_path is None:
+        mmap_path = os.path.join(os.path.dirname(os.path.abspath(path)), "C_memmap.dat")
+
+    def _is_int_line(s: str) -> bool:
+        toks = s.split()
+        if not toks: return False
+        for t in toks:
+            if t.startswith('+'): t = t[1:]
+            if not t.isdigit(): return False
+        return True
+
+    def _next_nonempty(f):
+        for line in f:
+            s = line.strip()
+            if s:
+                return s
+        return None
+
+    file_size = os.path.getsize(path) if os.path.exists(path) else 0
+    t0 = time.perf_counter()
+
+    # PASS 1: count blocks and widths
+    n_mo_total = 0; blocks = []
+    with open(path, 'r', buffering=1024*1024) as f:
+        while True:
+            line = f.readline()
+            if not line: break
+            s = line.strip()
+            if not _is_int_line(s): continue
+            n_cols = len(s.split())
+            if _next_nonempty(f) is None:
+                raise RuntimeError("Unexpected EOF while reading energies line (pass1).")
+            if _next_nonempty(f) is None:
+                raise RuntimeError("Unexpected EOF while reading occupations line (pass1).")
+            ao_count = 0
+            while ao_count < n_ao_total:
+                coeff_line = f.readline()
+                if not coeff_line: raise RuntimeError("Unexpected EOF in coefficients block (pass1).")
+                if coeff_line.strip(): ao_count += 1
+            blocks.append((n_mo_total, n_cols))
+            n_mo_total += n_cols
+
+    if n_mo_total == 0:
+        raise RuntimeError("No MO blocks detected in file.")
+
+    order = 'F'
+    if return_memmap:
+        C = np.memmap(mmap_path, mode='w+', dtype=dtype, shape=(n_ao_total, n_mo_total), order=order)
+    else:
+        C = np.empty((n_ao_total, n_mo_total), dtype=dtype, order=order)
+    eps = np.empty(n_mo_total, dtype=np.float64)
+    occ = np.empty(n_mo_total, dtype=np.float64)
+
+    # PASS 2: parse & fill, now with progress reporting
+    with open(path, 'r', buffering=1024*1024) as f:
+        blk_idx = 0
+        n_blocks = len(blocks)
+        print(f"[MOs] Starting parse of {n_mo_total} MOs from {os.path.basename(path)}...")
+        t1 = time.perf_counter()
+        while True:
+            line = f.readline()
+            if not line: break
+            s = line.strip()
+            if not _is_int_line(s): continue
+
+            offset, n_cols = blocks[blk_idx]; blk_idx += 1
+            col_slice = slice(offset, offset + n_cols)
+
+            # energies (fast path; allow wrapping)
+            vals = []
+            while len(vals) < n_cols:
+                e_line = _next_nonempty(f)
+                if e_line is None:
+                    raise RuntimeError(f"EOF reading energies at block {blk_idx}.")
+                arr = _parse_tail_floats(e_line, n_cols - len(vals))
+                if arr.size == 0:
+                    nums = _extract_numbers(e_line)
+                    arr = np.asarray(nums, dtype=float) if nums else np.array([], float)
+                vals.extend(arr.tolist())
+            eps[col_slice] = np.asarray(vals[:n_cols], dtype=np.float64)
+
+            # occupations
+            vals = []
+            while len(vals) < n_cols:
+                o_line = _next_nonempty(f)
+                if o_line is None:
+                    raise RuntimeError(f"EOF reading occupations at block {blk_idx}.")
+                arr = _parse_tail_floats(o_line, n_cols - len(vals))
+                if arr.size == 0:
+                    nums = _extract_numbers(o_line)
+                    arr = np.asarray(nums, dtype=float) if nums else np.array([], float)
+                vals.extend(arr.tolist())
+            occ[col_slice] = np.asarray(vals[:n_cols], dtype=np.float64)
+
+            # coefficients: n_ao_total lines
+            ao_row = 0
+            while ao_row < n_ao_total:
+                coeff_line = f.readline()
+                if not coeff_line:
+                    raise RuntimeError(f"EOF in coefficients block at block {blk_idx}, ao_row {ao_row}.")
+                sline = coeff_line.strip()
+                if not sline: continue
+
+                # fast tail (n_cols tokens); if short, we try to wrap
+                tail = _parse_tail_floats(sline, n_cols)
+                if tail.size < n_cols:
+                    acc = tail.tolist()
+                    while len(acc) < n_cols:
+                        extra = _next_nonempty(f)
+                        if extra is None:
+                            raise RuntimeError(f"EOF while wrapping coeff line at block {blk_idx}, ao_row {ao_row}.")
+                        more = _parse_tail_floats(extra, n_cols - len(acc))
+                        if more.size == 0:
+                            more = np.asarray(_extract_numbers(extra), dtype=float)
+                        acc.extend(more.tolist())
+                    tail = np.asarray(acc[-n_cols:], dtype=float)
+
+                C[ao_row, col_slice] = tail.astype(dtype, copy=False)
+                ao_row += 1
+
+            # Progress report
+            if (blk_idx % log_every == 0) or (blk_idx == 1) or (blk_idx == n_blocks):
+                now = time.perf_counter()
+                n_done = offset + n_cols
+                mb = file_size / (1024 ** 2) if file_size else 0.0
+                elapsed = now - t1
+                rate = n_done / elapsed if elapsed > 0 else 0
+                eta = (n_mo_total - n_done) / rate if rate > 0 else 0
+                print(f"[MOs] Block {blk_idx}/{n_blocks} | {n_done}/{n_mo_total} MOs "
+                      f"({100*n_done/n_mo_total:.1f}%) | "
+                      f"Elapsed: {elapsed:6.1f}s | "
+                      f"ETA: {eta:6.1f}s")
+
+    if isinstance(C, np.memmap):
+        C.flush()
+
+    t2 = time.perf_counter()
+    if verbose:
+        mb = file_size / (1024**2) if file_size else 0.0
+        print(f"[MOs] Finished parse in {t2-t0:.1f} seconds.")
+        print(f"[MOs] Parsed: C shape={C.shape} (dtype={dtype.__name__}, order={order}), eps={eps.shape}, occ={occ.shape})")
+        if isinstance(C, np.memmap):
+            print(f"[MOs] C memmap: {mmap_path}")
+        print(f"[MOs] Input size ~ {mb:,.1f} MB")
+
+    return C, eps, occ
+
+
+def write_c_to_csr(C, *, threshold=0.0, outpath="C_csr.npz",
+                   coeff_dtype=np.float32, verbose=True, chunk_rows=2048):
+    """
+    Convert dense/memmap C (n_ao x n_mo) to CSR on disk with absolute threshold |c|>=threshold.
+    Two-pass over rows (count -> fill) to preallocate exactly.
+    """
+    t0 = time.perf_counter()
+    n_ao, n_mo = C.shape
+
+    # Pass 1: count nnz per row
+    indptr = np.empty(n_ao + 1, dtype=np.int64)
+    indptr[0] = 0
+    nnz = 0
+    for r0 in range(0, n_ao, chunk_rows):
+        r1 = min(n_ao, r0 + chunk_rows)
+        block = C[r0:r1, :]
+        if threshold > 0.0:
+            nz_per_row = np.count_nonzero(np.abs(block) >= threshold, axis=1)
+        else:
+            nz_per_row = np.full(r1 - r0, n_mo, dtype=np.int64)
+        for i, k in enumerate(nz_per_row, start=r0):
+            nnz += int(k)
+            indptr[i + 1] = nnz
+
+    # Preallocate
+    indices = np.empty(nnz, dtype=np.int32)
+    data    = np.empty(nnz, dtype=coeff_dtype)
+
+    # Pass 2: fill
+    pos = 0
+    for r0 in range(0, n_ao, chunk_rows):
+        r1 = min(n_ao, r0 + chunk_rows)
+        block = C[r0:r1, :]
+        if threshold > 0.0:
+            mask = np.abs(block) >= threshold
+            for i in range(r1 - r0):
+                row_vals = block[i, :]
+                row_mask = mask[i, :]
+                nn = int(row_mask.sum())
+                if nn:
+                    cols = np.nonzero(row_mask)[0]
+                    indices[pos:pos+nn] = cols.astype(np.int32, copy=False)
+                    data[pos:pos+nn]    = row_vals[row_mask].astype(coeff_dtype, copy=False)
+                    pos += nn
+        else:
+            for i in range(r1 - r0):
+                indices[pos:pos+n_mo] = np.arange(n_mo, dtype=np.int32)
+                data[pos:pos+n_mo]    = block[i, :].astype(coeff_dtype, copy=False)
+                pos += n_mo
+
+    C_csr = csr_matrix((data, indices, indptr), shape=(n_ao, n_mo))
+    save_npz(outpath, C_csr)
+    secs = time.perf_counter() - t0
+
+    if verbose:
+        dens = nnz / (n_ao * n_mo)
+        print(f"[CSR] Wrote {outpath} | shape={n_ao}x{n_mo}, nnz={nnz:,}, density={dens:.4e}, time={secs:.2f}s")
+
+    return outpath, {'nnz': int(nnz), 'density': nnz/(n_ao*n_mo), 'seconds': secs}
+
+
 
 def _collect_coeffs_from_iterator(line_iter, n_coeffs_to_get, initial_coeffs):
     """Helper to read coefficients that may span multiple lines."""

@@ -1,5 +1,7 @@
 # analysis.py
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from . import utils
 
 def decompose_pop(pop_AO, ao_info, l_list, unique_syms):
@@ -33,9 +35,6 @@ def hermiticity_checks(Hx, Hy, Hz):
     print(f"[Herm] ||Re(Hy)||   = {np.linalg.norm(Hy.real):.3e}") # Should be pure imaginary
 
 # ===== analysis.py additions =====
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 
 def _type_order_default(unique_syms):
     # Stable default order
@@ -82,9 +81,6 @@ def plot_elevels_stackedbars_sidebyside(
     label1="spin-free", label2="SOC", outfile=None,
     H2EV=27.211386245988, bar_height_eV=0.05, alpha1=0.85, alpha2=0.85
 ):
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
 
     E1 = np.asarray(energies1_Ha) * H2EV
     E2 = np.asarray(energies2_Ha) * H2EV

@@ -80,32 +80,6 @@ def unique_atoms_syms(syms):
     """Returns a list of unique symbols, preserving order of first appearance."""
     return list(dict.fromkeys(syms))
 
-def lowdin_Ssqrt(S, eps=1e-10):
-    """Robust symmetric orthogonalization via S^(1/2)."""
-    w, U = np.linalg.eigh(S)
-    w_clipped = np.clip(w, eps, None)
-    return (U * np.sqrt(w_clipped)) @ U.T
-
-def ao_population_lowdin(alpha, beta, S):
-    """Calculates Löwdin population for a given spinor."""
-    Shalf = lowdin_Ssqrt(S)
-    alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
-    beta = np.atleast_2d(beta).T if beta.ndim == 1 else beta
-    a, b = Shalf @ alpha, Shalf @ beta
-    pop = (np.abs(a)**2 + np.abs(b)**2).real
-    pop_sum = pop.sum(axis=0, keepdims=True)
-    pop_sum[pop_sum < 1e-16] = 1.0
-    return np.squeeze(pop / pop_sum)
-
-def ao_population_lowdin_raw(alpha, beta, S):
-    """Löwdin AO population (UN-normalized). Columns sum to α†Sα + β†Sβ."""
-    Shalf = lowdin_Ssqrt(S)
-    alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
-    beta  = np.atleast_2d(beta).T  if beta.ndim  == 1 else beta
-    a, b = Shalf @ alpha, Shalf @ beta
-    pop = (np.abs(a)**2 + np.abs(b)**2).real
-    return np.squeeze(pop)
-
 
 def ao_population_mulliken(alpha, beta, S):
     """Calculates Mulliken population for a given spinor."""
@@ -149,9 +123,6 @@ def compute_nuclear_repulsion_from_list(coords_bohr, Z_list):
 def compute_total_energy(D, F, E_nuc):
     # D, F: AO basis, E_nuc: scalar
     return 0.5 * np.sum(D * (F + F.T)) + E_nuc
-
-# utils.py
-import numpy as np
 
 def select_mo_subspace_indices(
     eps_Ha,
@@ -245,5 +216,100 @@ def chol_orthonormalize(C, S_AO):
                          overwrite_b=False, check_finite=False)
     return X.conj().T
 
+def lowdin_Ssqrt(S, eps=1e-10):
+    """Robust symmetric orthogonalization via S^(1/2)."""
+    w, U = np.linalg.eigh(S)
+    w_clipped = np.clip(w, eps, None)
+    return (U * np.sqrt(w_clipped)) @ U.T
 
+def build_lowdin_ops(S, eps=1e-10):
+    """
+    Precompute eigendecomposition of S for repeated Lowdin uses.
+    Returns a dict with apply_shalf(X) and apply_sminushalf(X).
+    """
+    w, U = np.linalg.eigh(S)
+    w_clipped = np.clip(w, eps, None)
+    sqrt_w = np.sqrt(w_clipped)
+    inv_sqrt_w = 1.0 / sqrt_w
+
+    # For speed: make U Fortran-contiguous for BLAS-friendly gemms
+    U = np.asfortranarray(U)
+
+    def _proj(X):       # U^T @ X
+        return U.T @ X
+
+    def _lift(Y):       # U @ Y
+        return U @ Y
+
+    def apply_shalf(X):
+        # U diag(sqrt_w) U^T X  == U * (sqrt_w * (U^T X))
+        Y = _proj(X)
+        Y *= sqrt_w[:, None]
+        return _lift(Y)
+
+    def apply_sminushalf(X):
+        Y = _proj(X)
+        Y *= inv_sqrt_w[:, None]
+        return _lift(Y)
+
+    return {
+        "U": U,
+        "sqrt_w": sqrt_w,
+        "inv_sqrt_w": inv_sqrt_w,
+        "apply_shalf": apply_shalf,
+        "apply_sminushalf": apply_sminushalf,
+    }
+
+
+def ao_population_lowdin_with_ops(alpha, beta, ops):
+    """Löwdin AO population using precomputed apply_shalf (normalized columns)."""
+    apply_shalf = ops["apply_shalf"]
+    alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
+    beta  = np.atleast_2d(beta).T  if beta.ndim  == 1 else beta
+    a, b  = apply_shalf(alpha), apply_shalf(beta)
+    pop   = (np.abs(a)**2 + np.abs(b)**2).real
+    pop_sum = pop.sum(axis=0, keepdims=True)
+    pop_sum[pop_sum < 1e-16] = 1.0
+    return np.squeeze(pop / pop_sum)
+
+
+def ao_population_lowdin_raw_with_ops(alpha, beta, ops):
+    """UN-normalized Löwdin AO population using precomputed apply_shalf."""
+    apply_shalf = ops["apply_shalf"]
+    alpha = np.atleast_2d(alpha).T if alpha.ndim == 1 else alpha
+    beta  = np.atleast_2d(beta).T  if beta.ndim  == 1 else beta
+    a, b  = apply_shalf(alpha), apply_shalf(beta)
+    pop   = (np.abs(a)**2 + np.abs(b)**2).real
+    return np.squeeze(pop)
+
+def _save_spinors_npz_csv(outdir, basename, indices, energies_Ha, occ_vec, U_cols):
+    """
+    Save selected spinors to:
+      - NPZ: complex matrix U (columns = selected spinors) + energies/occ/indices
+      - CSV: summary table (idx, energy_Ha, energy_eV, occupation)
+    """
+    os.makedirs(outdir, exist_ok=True)
+    npz_path = os.path.join(outdir, f"{basename}.npz")
+    csv_path = os.path.join(outdir, f"{basename}.csv")
+    energies_eV = energies_Ha * config.H2EV
+        
+    # Save arrays (compressed)
+    np.savez_compressed(
+        npz_path,
+        indices=np.asarray(indices, dtype=np.int64),
+        energies_Ha=np.asarray(energies_Ha, dtype=np.float64),
+        energies_eV=np.asarray(energies_eV, dtype=np.float64),
+        occupations=np.asarray(occ_vec, dtype=np.float64),
+        U=U_cols.astype(np.complex128),      # shape: (2*n_ao, len(indices))
+    )       
+            
+    # Save a readable summary
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["spinor_index", "energy_Ha", "energy_eV", "occupation"])
+        for i, EH, EV, occ in zip(indices, energies_Ha, energies_eV, occ_vec):
+            w.writerow([int(i), float(EH), float(EV), float(occ)])
+
+    print(f"[WRITE] Spinors: {npz_path}")
+    print(f"[WRITE] Summary: {csv_path}")
 

@@ -338,12 +338,12 @@ def assemble_soc_matrices(n_ao, projector_params, shell_dicts_spherical,
         proj_col_offset += m
 
         # Per-block log line
-        dens_str = f"{block_info['density']:.4f}" if block_info['density'] is not None else "n/a"
-        print(f"[SOC blk] atom={atom_idx:3d} sym={sym:>2} l={l} "
-              f"n_loc={n_loc:4d} m={m:3d} dens={dens_str} "
-              f"rows({block_info['rows_pre']}→{block_info['rows_post']}:{rows_note}) "
-              f"paths=({paths['x']},{paths['y']},{paths['z']}) "
-              f"time={dt_blk:.3f}s")
+#        dens_str = f"{block_info['density']:.4f}" if block_info['density'] is not None else "n/a"
+#        print(f"[SOC blk] atom={atom_idx:3d} sym={sym:>2} l={l} "
+#              f"n_loc={n_loc:4d} m={m:3d} dens={dens_str} "
+#              f"rows({block_info['rows_pre']}→{block_info['rows_post']}:{rows_note}) "
+#              f"paths=({paths['x']},{paths['y']},{paths['z']}) "
+#              f"time={dt_blk:.3f}s")
 
     # ---- Symmetrize to clean numerical noise ----
     Hx = 0.5 * (Hx + Hx.conj().T)
