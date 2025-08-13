@@ -19,6 +19,36 @@ from . import hamiltonian
 from . import analysis
 from .config import parse_and_apply_cli  # <-- only this import for CLI
 
+from time import perf_counter
+import numpy as np
+import scipy
+import scipy.sparse
+from scipy.sparse import isspmatrix
+from scipy.linalg.blas import dsyrk
+
+def _syrk_full(A):
+    Af = np.asfortranarray(A, dtype=np.float64)
+    L = dsyrk(alpha=1.0, a=Af, lower=True, trans=0)      # L = A @ A.T (lower)
+    return L + L.T - np.diag(np.diag(L))                 # symmetrize
+
+def build_fock_from_SC(SC, eps, label=""):
+    """Given SC = S@C and MO energies eps, build F = S C eps C^T S via SYRK."""
+    t0 = perf_counter()
+    eps = np.asarray(eps, dtype=np.float64)
+    pos = eps > 0; neg = eps < 0
+    F = np.zeros((SC.shape[0], SC.shape[0]), dtype=np.float64)
+    t_syrk = 0.0
+    if np.any(pos):
+        t1 = perf_counter()
+        F += _syrk_full(SC[:, pos] * np.sqrt(eps[pos])[None, :])
+        t_syrk += perf_counter() - t1
+    if np.any(neg):
+        t1 = perf_counter()
+        F -= _syrk_full(SC[:, neg] * np.sqrt(-eps[neg])[None, :])
+        t_syrk += perf_counter() - t1
+    dt = perf_counter() - t0
+    print(f"[F_AO{('/'+label) if label else ''}] SYRK done in {dt*1e3:.0f} ms (SYRK part {t_syrk*1e3:.0f} ms)")
+    return F
 
 def main():
     """Main execution workflow."""
@@ -62,21 +92,35 @@ def main():
         C_AO, eps_Ha, occ = parsers.read_mos_auto(config.MO_PATH, n_ao, verbose=True)
         if hasattr(C_AO, "toarray"):
             C_AO = C_AO.toarray() 
+        print("\n--- Spin-free MO energies & occupations (RKS) ---")
+        for i, (e, o) in enumerate(zip(eps_Ha, occ), start=1):
+            print(f"MO {i:4d} :  E = {e:.6f} Ha  |  {e*27.2114:9.4f} eV  |  occ = {o:.6f}")
+        
         print("...done")
 
         n_mo = C_AO.shape[1]
         print("Building Overlap matrix with Libint")
-    
+        t1 = perf_counter() 
         S_AO = libint_cpp.overlap(shell_dicts_spherical, config.NTHREADS) if not config.PERIODIC else \
                libint_cpp.overlap_pbc(shell_dicts_spherical, config.LATTICE * config.BOHR_PER_ANG,
                                       cutoff_A=14, nthreads=config.NTHREADS)
-        print("...done")
+        dt = perf_counter() - t1 
+        print(f"...done in {dt:.3f} s ")
     
-        orth_err = np.linalg.norm(C_AO.T @ S_AO @ C_AO - np.eye(n_mo))
-        print(f"[CHECK] MO Orthogonality ||CᵀSC - I|| = {orth_err:.3e}")
+        print(f"[CHECK] MO Orthogonality ")
+        t1 = perf_counter()
+        SC = S_AO @ C_AO
+        print(f"[SC] built in {(perf_counter()-t1):.3f} s")
+
+        orth_err = np.linalg.norm(C_AO.T @ SC - np.eye(n_mo))
+        print(f"[CHECK] ||CᵀSC - I|| = {orth_err:.3e}")
+        dt = perf_counter() - t1 
+        print(f"...done in {dt:.3f} s ")
+
         print(f"Building spin-free Fock matrix in AO basis: F_AO = S * C * eps * C.T * S") 
         # H0 from eigen-decomposition (AO representation)
-        H0_ao = S_AO @ C_AO @ np.diag(eps_Ha) @ C_AO.T @ S_AO
+#        H0_ao = S_AO @ C_AO @ np.diag(eps_Ha) @ C_AO.T @ S_AO
+        H0_ao = build_fock_from_SC(SC, eps_Ha, label="RKS")
         print(f"...done") 
         # or: H0_ao = utils.ao_fock_from_mos(S_AO, C_AO, eps_Ha)
         S_total = np.kron(np.eye(2), S_AO)
@@ -110,21 +154,15 @@ def main():
             
     else:
         # --- UKS path ---
-#        C_a, eps_a, occ_a = parsers.read_mos_txt(config.MO_ALPHA_PATH, n_ao)
-#        C_b, eps_b, occ_b = parsers.read_mos_txt(config.MO_BETA_PATH,  n_ao)
         # New:
-        C_a, eps_a, occ_a = parsers.read_mos_txt_streaming(
+        C_a, eps_a, occ_a = parsers.read_mos_auto(
             config.MO_ALPHA_PATH, n_ao,
-            dtype=np.float32,
             mmap_path="C_alpha_memmap.dat",
-            return_memmap=True,
             verbose=True
         )
-        C_b, eps_b, occ_b = parsers.read_mos_txt_streaming(
+        C_b, eps_b, occ_b = parsers.read_mos_auto(
             config.MO_BETA_PATH, n_ao,
-            dtype=np.float32,
             mmap_path="C_beta_memmap.dat",
-            return_memmap=True,
             verbose=True
         )
         print("...done")
@@ -132,24 +170,44 @@ def main():
             C_a = C_a.toarray()
             C_b = C_b.toarray() 
 
+        print("\n--- Spin-free MO energies & occupations (UKS) ---")
+        print("Alpha spin:")
+        for i, (e, o) in enumerate(zip(eps_a, occ_a), start=1):
+            print(f"MOα {i:4d} :  E = {e:.6f} Ha  |  {e*27.2114:9.4f} eV  |  occ = {o:.6f}")
+        print("Beta spin:")
+        for i, (e, o) in enumerate(zip(eps_b, occ_b), start=1):
+            print(f"MOβ {i:4d} :  E = {e:.6f} Ha  |  {e*27.2114:9.4f} eV  |  occ = {o:.6f}")
+        
         n_mo_a, n_mo_b = C_a.shape[1], C_b.shape[1]
            
         print("Building Overlap matrix with Libint")
+        t1 = perf_counter()
         S_AO = libint_cpp.overlap(shell_dicts_spherical, config.NTHREADS) if not config.PERIODIC else \
                libint_cpp.overlap_pbc(shell_dicts_spherical, config.LATTICE * config.BOHR_PER_ANG,
                                       cutoff_A=14, nthreads=config.NTHREADS)
-        print("...done")
-    
-        err_a = np.linalg.norm(C_a.T @ S_AO @ C_a - np.eye(n_mo_a))
-        err_b = np.linalg.norm(C_b.T @ S_AO @ C_b - np.eye(n_mo_b))
+        dt = perf_counter() - t1 
+        print(f"...done in {dt:.3f} s ")
+  
+         
+        print(f"[CHECK] MO Orthogonality")
+        t1 = perf_counter()
+        SC_a = S_AO @ C_a
+        SC_b = S_AO @ C_b
+        print(f"[SC] alpha/beta built in {(perf_counter()-t1):.3f} s")
+
+        err_a = np.linalg.norm(C_a.T @ SC_a - np.eye(n_mo_a))
+        err_b = np.linalg.norm(C_b.T @ SC_b - np.eye(n_mo_b))
+        dt = perf_counter() - t1
         print(f"[CHECK] ||CᵀSC - I|| (alpha) = {err_a:.3e} | (beta) = {err_b:.3e}")
-        
+        print(f"...done in {dt:.3f} s ")
          
         print(f"Building spin-free Fock matrix for alpha electrons in AO basis: F_AO = S * C * eps * C.T * S") 
-        H0_a = S_AO @ C_a @ np.diag(eps_a) @ C_a.T @ S_AO   # utils.ao_fock_from_mos(S_AO, C_a, eps_a)
+#        H0_a = S_AO @ C_a @ np.diag(eps_a) @ C_a.T @ S_AO   # utils.ao_fock_from_mos(S_AO, C_a, eps_a)
+        H0_a = build_fock_from_SC(SC_a, eps_a, label="UKS-α")
         print("...done")
         print(f"Building spin-free Fock matrix for beta electrons in AO basis: F_AO = S * C * eps * C.T * S")
-        H0_b = S_AO @ C_b @ np.diag(eps_b) @ C_b.T @ S_AO   # utils.ao_fock_from_mos(S_AO, C_b, eps_b)
+#        H0_b = S_AO @ C_b @ np.diag(eps_b) @ C_b.T @ S_AO   # utils.ao_fock_from_mos(S_AO, C_b, eps_b)
+        H0_b = build_fock_from_SC(SC_b, eps_b, label="UKS-β")
         print("...done")
     
         # Spinor overlap is unchanged; H0 becomes block-diagonal (α ⊕ β)
@@ -254,17 +312,21 @@ def main():
     
         print(f"[INFO] RKS subspace size k={len(idx_sel)}")
         # Use helper to solve in the selected MO subspace
+        t1 = perf_counter() 
+        print(f"[INFO] Diagonalizing the full H = H0 + HSO") 
         E_soc_Ha, U_soc_mo, U_soc_ao = hamiltonian.solve_soc_in_mo_subspace_rks(
             C_AO, eps_Ha, S_AO, Hx_eff, Hy_eff, Hz_eff, idx_sel, debug=True
         )    
- 
+        dt = perf_counter() - t1
+        print(f"...done in {dt:.3f} s ")
+
         # Occupations within the subspace (fill Ne)
-        Ne = int(round(np.sum(occ)))
+        Ne_sub = int(round(np.sum(occ[idx_sel])))
         order = np.argsort(E_soc_Ha)
         f_spinor = np.zeros_like(E_soc_Ha)
-        # Correctly handle filling for systems smaller than Ne
-        n_to_fill = min(Ne, len(f_spinor))
+        n_to_fill = min(Ne_sub, len(f_spinor))
         f_spinor[order[:n_to_fill]] = 1.0
+        print(f"[INFO] electrons filled in THIS solve = {int(f_spinor.sum())}")
  
     elif subspace_enabled and config.UKS:
         # -------- UKS subspace solve --------
@@ -273,15 +335,20 @@ def main():
     
         print(f"[INFO] UKS subspace sizes: kα={len(idx_sel_a)}, kβ={len(idx_sel_b)}") 
 
+        t1 = perf_counter() 
+        print(f"[INFO] Diagonalizing the full H = H0 + HSO") 
         E_soc_Ha, U_soc_mo, U_soc_ao = hamiltonian.solve_soc_in_mo_subspace_uks(
             C_a, eps_a, C_b, eps_b, S_AO, Hx_eff, Hy_eff, Hz_eff, idx_sel_a, idx_sel_b
         )
- 
-        Ne = int(round(np.sum(occ_a) + np.sum(occ_b)))
+        dt = perf_counter() - t1
+        print(f"...done in {dt:.3f} s ")
+        Ne_sub = int(round(np.sum(occ_a[idx_sel_a]) + np.sum(occ_b[idx_sel_b])))
         order = np.argsort(E_soc_Ha)
         f_spinor = np.zeros_like(E_soc_Ha)
-        f_spinor[order[:min(Ne, len(f_spinor))]] = 1.0
-    
+        f_spinor[order[:min(Ne_sub, len(f_spinor))]] = 1.0
+         
+        print(f"[INFO] electrons filled in THIS solve = {int(f_spinor.sum())}")
+         
     else:
         # -------- Full AO spinor solve (your original path) --------
         sigma_x = np.array([[0, 1], [1, 0]], dtype=complex)
@@ -293,7 +360,11 @@ def main():
                             np.kron(sigma_z, Hz_filt))
         H_total = H0_total - H_SO_total
     
+        t1 = perf_counter() 
+        print(f"[INFO] Diagonalizing the full H = H0 + HSO") 
         E_soc_Ha, U_soc_ao = eigh(H_total, b=S_total)
+        dt = perf_counter() - t1
+        print(f"...done in {dt:.3f} s ")
     
         Ne = int(round(np.sum(occ)))
         order = np.argsort(E_soc_Ha)
@@ -301,7 +372,7 @@ def main():
         f_spinor[order[:Ne]] = 1.0
  
     E_band_soc = float(np.dot(f_spinor, E_soc_Ha))
-    print(f"\n[ENERGY] Band energy with SOC (fill {Ne} spinors): {E_band_soc:.8f} Ha")
+    print(f"\n[ENERGY] Band energy with SOC (fill {int(np.round(f_spinor.sum()))} spinors): {E_band_soc:.8f} Ha")
     print(f"[ENERGY] Band + E_nuc(q_val) with SOC:            {E_band_soc + E_nuc:.8f} Ha")
     print("Solver finished.")
     
@@ -312,8 +383,23 @@ def main():
     unique_syms = utils.unique_atoms_syms(syms)
 
     # === NEW: build Lowdin ops for S_AO once and reuse everywhere ===
-    lowdin_ops = utils.build_lowdin_ops(S_AO)
-
+    t0 = perf_counter()
+    use_cheb = (scipy.sparse.issparse(S_AO) and S_AO.nnz / (S_AO.shape[0]**2) < 0.1)
+    if use_cheb:
+        lowdin_ops = utils.build_lowdin_ops_sparse_cheby(
+            S_AO,
+            deg=getattr(config, "LOWDIN_DEG", 32),  # after Jacobi+Gershgorin, 24–32 often enough
+            which="sqrt",
+            use_jacobi=getattr(config, "LOWDIN_JACOBI", True),
+            eps=getattr(config, "LOWDIN_EPS", 1e-8),
+        )
+        print(f"[LOWDIN/CHEB] deg={lowdin_ops['deg']} λ∈[{lowdin_ops['lam_min']:.3e},{lowdin_ops['lam_max']:.3e}]")
+    else:
+        lowdin_ops = utils.build_lowdin_ops(S_AO)
+        print("[LOWDIN] using block-Löwdin (dense S or high fill)")
+    dt = perf_counter() - t0 
+    print(f"...done in {dt:.3f} s ")
+    
     ## --- Analysis 1: Spin-Free MOs (Löwdin AO basis) ---
     N_print = config.N_print
     
@@ -359,49 +445,54 @@ def main():
 
     ## --- Analysis 2: SOC Spinors in AO Basis ---
     print("\n--- Population Analysis of SOC Spinors (Löwdin AO basis) ---")
-    total_electrons = int(round(sum(occ)))
-    idx_sorted = np.argsort(E_soc_Ha)
-    N_print_soc = N_print * 2 
-    to_print = list(idx_sorted[max(0, total_electrons - N_print_soc): total_electrons]) + \
-               list(idx_sorted[total_electrons: total_electrons + N_print_soc])
+
+    # Build safe print window around Fermi in *spinor index* space
+    n_spin = int(E_soc_Ha.size)
+    assert f_spinor.shape == E_soc_Ha.shape == (n_spin,)
     
-    # ### CHANGED: avoid forming S_total; compute norms via S_AO on alpha/beta blocks
-    alpha_full = U_soc_ao[:n_ao, :]          # (n_ao, k)
-    beta_full  = U_soc_ao[n_ao:, :]          # (n_ao, k)
+    idx_sorted  = np.argsort(E_soc_Ha)                 # ascending energies
+    fermi_count = int(np.clip(np.round(f_spinor.sum()), 0, n_spin))
+    N_print_soc = int(N_print) * 2
     
-    Sa_alpha = S_AO @ alpha_full             # (n_ao, k)
-    Sa_beta  = S_AO @ beta_full              # (n_ao, k)
-    norms = (np.einsum('ij,ij->j', alpha_full.conj(), Sa_alpha) +
-             np.einsum('ij,ij->j', beta_full.conj(),  Sa_beta)).real
-    norms = np.clip(norms, 1e-15, None)
-    U_soc_norm = U_soc_ao / np.sqrt(norms)[None, :]
+    L = max(0, fermi_count - N_print_soc)
+    R = min(n_spin, fermi_count + N_print_soc)
+    to_print = np.concatenate([idx_sorted[L:fermi_count], idx_sorted[fermi_count:R]], axis=0)
+    if to_print.size == 0:
+        take = min(2*N_print_soc, n_spin)
+        to_print = idx_sorted[-take:]
     
-    alpha_mat = U_soc_norm[:n_ao, to_print]
-    beta_mat  = U_soc_norm[n_ao:, to_print]
+    # --- Take ONLY the selected columns; no full S@U ---
+    alpha_sel = U_soc_ao[:n_ao, to_print]             # (n_ao, n_sel)
+    beta_sel  = U_soc_ao[n_ao:, to_print]             # (n_ao, n_sel)
     
-    # ### CHANGED: reuse Lowdin ops (un-normalized for α/β totals)
-    pop_alpha_raw = utils.ao_population_lowdin_raw_with_ops(alpha_mat, np.zeros_like(alpha_mat), lowdin_ops)
-    pop_beta_raw  = utils.ao_population_lowdin_raw_with_ops(np.zeros_like(beta_mat),  beta_mat,  lowdin_ops)
+    # --- Apply Löwdin S^{1/2} to the selected columns (fast path) ---
+    # This both gives correct Löwdin populations and correct normalization:
+    #   ||S^{1/2} c||^2 = c^† S c
+    Y_alpha = utils.lowdin_apply_shalf(alpha_sel, lowdin_ops)   # shape (n_ao, n_sel)
+    Y_beta  = utils.lowdin_apply_shalf(beta_sel,  lowdin_ops)   # shape (n_ao, n_sel)
     
-    alpha_tot = pop_alpha_raw.sum(axis=0)
-    beta_tot  = pop_beta_raw.sum(axis=0)
-    
-    pop_tot_raw = pop_alpha_raw + pop_beta_raw
-    colsum = pop_tot_raw.sum(axis=0, keepdims=True)
+    # Column norms (should be ~1.0 if U_soc_ao are S-normalized spinors)
+    alpha_tot = np.einsum('ij,ij->j', Y_alpha.conj(), Y_alpha).real
+    beta_tot  = np.einsum('ij,ij->j', Y_beta.conj(),  Y_beta ).real
+    colsum    = alpha_tot + beta_tot
     colsum[colsum < 1e-16] = 1.0
-    pop_norm = pop_tot_raw / colsum
     
-    for i, idx in enumerate(to_print):
-        E_eV = E_soc_Ha[idx] * config.H2EV
-        is_occ = (idx in idx_sorted[:total_electrons])
-        pop_ao = pop_norm[:, i]
-        pop_alpha = float(alpha_tot[i])
-        pop_beta  = float(beta_tot[i])
-        contrib = analysis.decompose_pop(pop_ao, ao_info, l_list, unique_syms)
+    # Per-AO Löwdin populations (normalized by total per column)
+    pop_tot_raw = (Y_alpha.conj() * Y_alpha).real + (Y_beta.conj() * Y_beta).real   # (n_ao, n_sel)
+    pop_norm    = pop_tot_raw / colsum[None, :]
+    
+    for col, idx in enumerate(to_print):
+        E_eV   = float(E_soc_Ha[idx] * config.H2EV)
+        is_occ = bool(f_spinor[idx] > 0.5)
+    
+        # Aggregate per-atom / per-l from AO populations
+        contrib   = analysis.decompose_pop(pop_norm[:, col], ao_info, l_list, unique_syms)
         contrib_str = analysis.format_contrib(contrib, l_labels)
-        print(f"Spinor {idx+1:4d} | E = {E_eV:9.4f} eV | Occ = {int(is_occ):d} | "
-              f"α={pop_alpha:.3f}, β={pop_beta:.3f} | {contrib_str}")    
     
+        print(f"Spinor {idx+1:4d} | E = {E_eV:9.4f} eV | Occ = {int(is_occ):d} | "
+              f"α={alpha_tot[col]:.3f}, β={beta_tot[col]:.3f} | {contrib_str}")
+    
+
     ## --- Analysis 3: SOC Spinors in Spin-Free MO Basis (fast path) ---
     if config.UKS:
         print("\n--- Population Analysis of SOC Spinors in terms of UKS Spin-Free MOs (fast) ---")
@@ -413,7 +504,7 @@ def main():
         n_mo_a = C_a_ortho.shape[1]
         n_mo_b = C_b_ortho.shape[1]
     
-        U_sel  = U_soc_norm[:, to_print]
+        U_sel  = U_soc_ao[:, to_print]
         alpha  = np.asfortranarray(U_sel[:n_ao, :])
         beta   = np.asfortranarray(U_sel[n_ao:, :])
     
@@ -434,7 +525,7 @@ def main():
     
         for col, idx in enumerate(to_print):
             E_eV   = E_soc_Ha[idx] * config.H2EV
-            is_occ = (idx in idx_sorted[:total_electrons])
+            is_occ = bool(f_spinor[idx] > 0.5)
             wcol    = w_sf[:, col]
             w_alpha = wcol[:n_mo_a].sum()
             w_beta  = wcol[n_mo_a:].sum()
@@ -449,7 +540,7 @@ def main():
         C_ortho = utils.chol_orthonormalize(C_AO, S_AO)
         C_ortho = np.asfortranarray(C_ortho)
     
-        U_sel  = U_soc_norm[:, to_print]
+        U_sel  = U_soc_ao[:, to_print]
         alpha  = np.asfortranarray(U_sel[:n_ao, :])
         beta   = np.asfortranarray(U_sel[n_ao:, :])
     
@@ -467,7 +558,7 @@ def main():
     
         for i, idx in enumerate(to_print):
             E_eV   = E_soc_Ha[idx] * config.H2EV
-            is_occ = (idx in idx_sorted[:total_electrons])
+            is_occ = bool(f_spinor[idx] > 0.5)
             idx_top = np.argsort(-w_sf[:, i])[:5]
             sfmo_line = ", ".join([f"MO {k+1} ({w_sf[k, i]*100:.1f}%)" for k in idx_top])
             print(f"Spinor {idx+1:4d} | E = {E_eV:9.4f} eV | Occ = {int(is_occ):d} | Comp: {sfmo_line}")
@@ -537,11 +628,11 @@ def main():
     # --- Optional: write SOC eigenvectors/eigenvalues/occupations ---
     if getattr(config, "WRITE_SPINORS", False):
         if getattr(config, "SPINORS_SUBSET", "printed") == "all":
-            indices = list(range(U_soc_norm.shape[1]))
+            indices = list(range(U_soc_ao.shape[1]))
         else:
             indices = list(to_print)  # the selection you already compute for printing
 
-        U_cols = U_soc_norm[:, indices]          # normalized columns (spinors)
+        U_cols = U_soc_ao[:, indices]          # normalized columns (spinors)
         energies_sel = E_soc_Ha[indices]
         occ_sel = f_spinor[indices]
 

@@ -28,7 +28,7 @@ def save_mo_csr_singlefile(C, eps, occ, outpath):
     )
     print(f"[MOs] Wrote C, eps, occ to: {outpath}")
 
-def read_mos_auto(path, n_ao_total, verbose=False):
+def read_mos_auto(path, n_ao_total, mmap_path=None, verbose=False):
     from scipy import sparse
     import numpy as np
     import os

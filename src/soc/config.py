@@ -69,6 +69,11 @@ mo_indices = [1000, 1000]
 MO_WINDOW_ALPHA = None   # e.g. [232, 620]
 MO_WINDOW_BETA  = None   # e.g. [232, 620]
 
+LOWDIN_CHEBYSHEV_DEG = 64     # 48–96 is a good band; increase if cond(S) is huge
+LOWDIN_JACOBI = True          # improves convergence degree
+S_DROP_TOL = 1e-12            # sparsify tiny overlaps (0 disables)
+S_EPS = 1e-10                 # clip tiny eigenvalues to avoid blowups
+
 def _parse_span_to_pair(s: str):
     """
     Accepts formats like '233:619', '233,619', '[233,619]'.
