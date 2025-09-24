@@ -294,7 +294,7 @@ If you use **SOC** in your research, please cite:
 ## 🆘 Support
 
 - For help, open a GitHub Issue: <https://github.com/nlesc-nano/SOC/issues>
-- For scientific consulting or collaboration, contact: i.infante@cicnano.es
+- For scientific consulting or collaboration, contact: ivan.infante@bcmaterials.net
 
 ---
 
